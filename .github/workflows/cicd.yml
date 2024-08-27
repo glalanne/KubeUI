@@ -66,26 +66,32 @@ jobs:
             fileName: KubeUI.Desktop.exe
             runs-on: windows-latest
             icon: --icon ../KubeUI/Assets/icon.ico
+            extra: ''
           - rid: win-arm64
             fileName: KubeUI.Desktop.exe
             runs-on: windows-latest
             icon: --icon ../KubeUI/Assets/icon.ico
+            extra: ''
           - rid: linux-x64
             fileName: KubeUI.Desktop
             runs-on: ubuntu-latest
             icon: ''
+            extra: ''
           - rid: linux-arm64
             fileName: KubeUI.Desktop
             runs-on: ubuntu-latest
             icon: ''
+            extra: ''
           - rid: osx-x64
             fileName: KubeUI.Desktop
             runs-on: macos-latest
             icon: --icon ../KubeUI/Assets/icon.icns
+            extra: --self-contained true
           - rid: osx-arm64
             fileName: KubeUI.Desktop
             runs-on: macos-latest
             icon: --icon ../KubeUI/Assets/icon.icns
+            extra: --self-contained true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,7 +111,7 @@ jobs:
 
       - name: Publish
         working-directory: src/KubeUI.Desktop
-        run: dotnet publish -c Release -r ${{ matrix.rid }} -o bin/publish -p:Version=${{ needs.semantic-release.outputs.new_release_version }}
+        run: dotnet publish -c Release -r ${{ matrix.rid }} -o bin/publish -p:Version=${{ needs.semantic-release.outputs.new_release_version }} ${{ matrix.extra }}
 
       - name: Create Release
         working-directory: src/KubeUI.Desktop
