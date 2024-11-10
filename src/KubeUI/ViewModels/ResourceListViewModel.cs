@@ -3,6 +3,7 @@ using System.Linq.Expressions;
 using System.Reflection;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using Avalonia.Controls.Notifications;
 using Avalonia.Data.Converters;
 using Avalonia.Styling;
 using Dock.Model.Core;
@@ -26,6 +27,7 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
 {
     private readonly ILogger<ResourceListViewModel<T>> _logger;
     private readonly IDialogService _dialogService;
+    private readonly INotificationManager _notificationManager;
 
     [ObservableProperty]
     private ICluster _cluster;
@@ -57,6 +59,7 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
     {
         _logger = Application.Current.GetRequiredService<ILogger<ResourceListViewModel<T>>>();
         _dialogService = Application.Current.GetRequiredService<IDialogService>();
+        _notificationManager = Application.Current.GetRequiredService<INotificationManager>();
     }
 
     public void Initialize(ICluster cluster)
@@ -79,10 +82,11 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
     {
         _filter?.Dispose();
 
-        _filter = Objects.ToObservableChangeSet<ConcurrentObservableDictionary<NamespacedName, T>, KeyValuePair<NamespacedName, T>>()
+        _filter = Objects
+            .ToObservableChangeSet<ConcurrentObservableDictionary<NamespacedName, T>, KeyValuePair<NamespacedName, T>>()
             .Filter(GenerateFilter())
-            .Bind(out var filteredObjects)
-            .Subscribe((_) => { }, (y) => _logger.LogError(y, "Error Set Namespace Filter"));
+            .Bind(out var filteredObjects, BindingOptions.NeverFireReset(false))
+            .Subscribe((_) => { }, (y) => _logger.LogError(y, "Error Set Namespace Filter: {ns}", typeof(T)));
 
         DataGridObjects = filteredObjects;
     }
@@ -236,13 +240,7 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
                 new ResourceListViewDefinitionColumn<V1Node, string>()
                 {
                     Name = "Taints",
-                    Field = x => x.Metadata.Annotations.TryGetValue("scheduler.alpha.kubernetes.io/taints", out var value) ? value : "",
-                    Width = nameof(DataGridLengthUnitType.SizeToHeader)
-                },
-                new ResourceListViewDefinitionColumn<V1Node, string>()
-                {
-                    Name = "Roles",
-                    Field = x => x.Metadata.Annotations.Any(x => x.Key.StartsWith("node-role.kubernetes.io/")) ? x.Metadata.Annotations.Where(x => x.Key.StartsWith("node-role.kubernetes.io/")).Select(x => x.Value).Aggregate((x,y) => x + ", " + y) : "",
+                    Field = x => x?.Spec?.Taints?.Select(x => $"{x.Key}={x.Effect}").Aggregate((x,y) => $"{x}, {y}") ?? "",
                     Width = nameof(DataGridLengthUnitType.SizeToHeader)
                 },
                 new ResourceListViewDefinitionColumn<V1Node, string>()
@@ -258,6 +256,31 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
                     Width = nameof(DataGridLengthUnitType.SizeToCells)
                 },
                 AgeColumn(),
+            ];
+
+            definition.MenuItems =
+            [
+                new()
+                {
+                    Header = "Cordon",
+                    IconResource = "stop_regular",
+                    CommandPath = nameof(ResourceListViewModel<V1Pod>.CordonNodeCommand),
+                    CommandParameterPath = "SelectedItems",
+                },
+                new()
+                {
+                    Header = "UnCordon",
+                    IconResource = "play_regular",
+                    CommandPath = nameof(ResourceListViewModel<V1Pod>.UnCordonNodeCommand),
+                    CommandParameterPath = "SelectedItems",
+                },
+                new()
+                {
+                    Header = "Drain",
+                    IconResource = "arrow_sync_regular",
+                    CommandPath = nameof(ResourceListViewModel<V1Pod>.DrainNodeCommand),
+                    CommandParameterPath = "SelectedItems",
+                },
             ];
         }
         else if (resourceType == typeof(V1Namespace))
@@ -289,13 +312,13 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
                 new ResourceListViewDefinitionColumn<Corev1Event, string>()
                 {
                     Name = "Type",
-                    Field = x => x.Type,
+                    Field = x => x?.Type ?? "",
                     Width = nameof(DataGridLengthUnitType.SizeToCells)
                 },
                 new ResourceListViewDefinitionColumn<Corev1Event, string>()
                 {
                     Name = "Message",
-                    Field = x => x.Message,
+                    Field = x => x?.Message ?? "",
                     Width = "4*"
                 },
                 NamespaceColumn(),
@@ -308,7 +331,7 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
                 new ResourceListViewDefinitionColumn<Corev1Event, string>()
                 {
                     Name = "Source",
-                    Field = x => x.Source.Component ?? "",
+                    Field = x => x?.Source?.Component ?? "",
                     Width = "*"
                 },
                 new ResourceListViewDefinitionColumn<Corev1Event, int>()
@@ -1601,9 +1624,20 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
 
         if (result == ContentDialogResult.Primary)
         {
+            var exceptions = new List<Exception>();
+
             foreach (var item in items.Cast<KeyValuePair<NamespacedName, T>>().ToList())
             {
-                await Cluster.Delete<T>(item.Value);
+                try
+                {
+                    await Cluster.Delete<T>(item.Value);
+
+                }
+                catch (Exception ex)
+                {
+                    exceptions.Add(ex);
+                    Utilities.HandleException(_logger, _notificationManager, ex, $"Error Deleting {item.Key.Namespace}/{item.Key.Name}", sendNotification: true);
+                }
             }
         }
     }
@@ -1744,7 +1778,6 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
                Cluster.CanI<V1Pod>(Verb.Create, ((KeyValuePair<NamespacedName, V1Pod>)SelectedItem).Key.Namespace, "portforward");
     }
 
-
     [RelayCommand(CanExecute = nameof(CanPortForwardService))]
     private async Task PortForwardService(V1ServicePort containerPort)
     {
@@ -1813,13 +1846,13 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
     private static readonly string s_restartControllerPatch = $$"""
     {
         "spec": {
-        "template": {
-            "metadata": {
-            "annotations": {
-                "kubectl.kubernetes.io/restartedAt": "{{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ}}"
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": "{{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ}}"
+                    }
+                }
             }
-            }
-        }
         }
     }
     """;
@@ -1847,7 +1880,7 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error Restarting Deployment");
+            Utilities.HandleException(_logger, _notificationManager, ex, "Error Restarting Deployment", sendNotification: true);
         }
     }
 
@@ -1879,7 +1912,7 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error Restarting ReplicaSet");
+            Utilities.HandleException(_logger, _notificationManager, ex, "Error Restarting ReplicaSet", sendNotification: true);
         }
     }
 
@@ -1911,7 +1944,7 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error Restarting StatefulSet");
+            Utilities.HandleException(_logger, _notificationManager, ex, "Error Restarting StatefulSet", sendNotification: true);
         }
     }
 
@@ -1943,13 +1976,170 @@ public partial class ResourceListViewModel<T> : ViewModelBase, IInitializeCluste
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error Restarting DaemonSet");
+            Utilities.HandleException(_logger, _notificationManager, ex, "Error Restarting DaemonSet", sendNotification: true);
         }
     }
 
     private bool CanRestartDaemonSet(V1DaemonSet daemonSet)
     {
         return daemonSet != null && Cluster.CanI<V1DaemonSet>(Verb.Patch, daemonSet.Namespace());
+    }
+
+    [RelayCommand(CanExecute = nameof(CanCordonNode))]
+    private async Task CordonNode(IList items)
+    {
+        ContentDialogSettings settings = new()
+        {
+            Title = Resources.ResourceListViewModel_CordonNode_Title,
+            Content = string.Format(Resources.ResourceListViewModel_CordonNode_Content, items.Count),
+            PrimaryButtonText = Resources.ResourceListViewModel_CordonNode_Primary,
+            SecondaryButtonText = Resources.ResourceListViewModel_CordonNode_Secondary,
+            DefaultButton = ContentDialogButton.Secondary
+        };
+
+        var result = await _dialogService.ShowContentDialogAsync(this, settings);
+
+        var patch = $$"""
+        {
+            "spec": {
+                "unschedulable": true
+            }
+        }
+        """;
+
+        if (result == ContentDialogResult.Primary)
+        {
+            foreach (var item in items.Cast<KeyValuePair<NamespacedName, V1Node>>().ToList())
+            {
+                try
+                {
+                    await Cluster.Client.CoreV1.PatchNodeAsync(new V1Patch(patch, V1Patch.PatchType.MergePatch), item.Key.Name, item.Key.Namespace);
+                }
+                catch (Exception ex)
+                {
+                    Utilities.HandleException(_logger, _notificationManager, ex, "Error Cordoning Node", sendNotification: true);
+                }
+            }
+        }
+    }
+
+    private bool CanCordonNode(IList items)
+    {
+        return Cluster.CanI<V1Node>(Verb.Patch);
+    }
+
+    [RelayCommand(CanExecute = nameof(CanUnCordonNode))]
+    private async Task UnCordonNode(IList items)
+    {
+        ContentDialogSettings settings = new()
+        {
+            Title = Resources.ResourceListViewModel_UnCordonNode_Title,
+            Content = string.Format(Resources.ResourceListViewModel_UnCordonNode_Content, items.Count),
+            PrimaryButtonText = Resources.ResourceListViewModel_UnCordonNode_Primary,
+            SecondaryButtonText = Resources.ResourceListViewModel_UnCordonNode_Secondary,
+            DefaultButton = ContentDialogButton.Secondary
+        };
+
+        var result = await _dialogService.ShowContentDialogAsync(this, settings);
+
+        var patch = $$"""
+        {
+            "spec": {
+                "unschedulable": false
+            }
+        }
+        """;
+
+        if (result == ContentDialogResult.Primary)
+        {
+            foreach (var item in items.Cast<KeyValuePair<NamespacedName, V1Node>>().ToList())
+            {
+                try
+                {
+                    await Cluster.Client.CoreV1.PatchNodeAsync(new V1Patch(patch, V1Patch.PatchType.MergePatch), item.Key.Name, item.Key.Namespace);
+                }
+                catch (Exception ex)
+                {
+                    Utilities.HandleException(_logger, _notificationManager, ex, "Error UnCordoning Node", sendNotification: true);
+                }
+            }
+        }
+    }
+
+    private bool CanUnCordonNode(IList items)
+    {
+        return Cluster.CanI<V1Node>(Verb.Patch);
+    }
+
+    [RelayCommand(CanExecute = nameof(CanCordonNode))]
+    private async Task DrainNode(IList items)
+    {
+        ContentDialogSettings settings = new()
+        {
+            Title = Resources.ResourceListViewModel_DrainNode_Title,
+            Content = string.Format(Resources.ResourceListViewModel_DrainNode_Content, items.Count),
+            PrimaryButtonText = Resources.ResourceListViewModel_DrainNode_Primary,
+            SecondaryButtonText = Resources.ResourceListViewModel_DrainNode_Secondary,
+            DefaultButton = ContentDialogButton.Secondary
+        };
+
+        var result = await _dialogService.ShowContentDialogAsync(this, settings);
+
+        var patch = $$"""
+        {
+            "spec": {
+                "unschedulable": true
+            }
+        }
+        """;
+
+        if (result == ContentDialogResult.Primary)
+        {
+            foreach (var item in items.Cast<KeyValuePair<NamespacedName, V1Node>>().ToList())
+            {
+                try
+                {
+                    await Cluster.Client.CoreV1.PatchNodeAsync(new V1Patch(patch, V1Patch.PatchType.MergePatch), item.Key.Name, item.Key.Namespace);
+
+                    var pods = await Cluster.GetObjectDictionaryAsync<V1Pod>();
+
+                    foreach (var pod in pods)
+                    {
+                        if (pod.Value.Spec.NodeName == item.Value.Metadata.Name)
+                        {
+                            V1Eviction evict = new()
+                            {
+                                ApiVersion = V1Eviction.KubeGroup + "/" + V1Eviction.KubeApiVersion,
+                                Kind = V1Eviction.KubeKind,
+                                Metadata = new()
+                                {
+                                    Name = pod.Value.Metadata.Name,
+                                    NamespaceProperty = pod.Value.Metadata.NamespaceProperty
+                                }
+                            };
+
+                            try
+                            {
+                                await Cluster.Client.CoreV1.CreateNamespacedPodEvictionAsync(evict, pod.Value.Metadata.Name, pod.Value.Metadata.NamespaceProperty);
+                            }
+                            catch (Exception ex)
+                            {
+                                Utilities.HandleException(_logger, _notificationManager, ex, "Error Evicting Pod", sendNotification: true);
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Utilities.HandleException(_logger, _notificationManager, ex, "Error Draining Node", sendNotification: true);
+                }
+            }
+        }
+    }
+
+    private bool CanDrainNode(IList items)
+    {
+        return Cluster.CanI<V1Node>(Verb.Patch);
     }
 
     #endregion
